@@ -15,15 +15,16 @@ import os
 import time
 import tracemalloc
 import sqlite3
+from getpass import getpass
 
 # Intentar importar psycopg2 para PostgreSQL. Si el estudiante no lo tiene instalado o no tiene Postgres corriendo,
 # se incluye soporte alternativo automático con SQLite para pruebas locales.
 try:
-    import psycopg2
-    from psycopg2.extras import execute_values
-    POSTGRES_DISPONIBLE = True
+    from mysql import connector
+    MYSQL_DISPONIBLE = True
 except ImportError:
-    POSTGRES_DISPONIBLE = False
+    connector = None
+    MYSQL_DISPONIBLE = False
 
 
 # =============================================================================
@@ -50,38 +51,25 @@ def extractor_lotes_csv(ruta_csv, tamano_lote=2000):
     # 4. Cuando len(lote) == tamano_lote, emitir el lote usando: yield lote
     # 5. Reiniciar la lista 'lote = []' para la siguiente iteración.
     # 6. Al salir del bucle, si quedan elementos remanentes en 'lote', emitirlos con 'yield lote'.
-    dir_padre = os.path.dirname(ruta_csv)
-    if dir_padre and not os.path.exists(dir_padre):
-           os.makedirs(dir_padre)
-   
-    with open(ruta_csv, "w", encoding="utf-8") as f:
-        for i in range(1, 101):
-                registro = {
-                   "id": i,
-                   "nombre": f"Estudiante {i}",
-                   "nota": round(7.0 + (i % 4) * 0.75, 2),
-                   "materia": "Gestión de Datos"
-                }
-                f.write(json.dumps(registro, ensure_ascii=False) + "\n")
-                            
-        print(f"[OK] Archivo '{ruta_csv}' creado con 100 registros en formato JSONL.\n")
                 
-                
-    
     if not os.path.exists(ruta_csv):
         raise FileNotFoundError(f"No existe el archivo: {ruta_csv}")
 
-    with open(ruta_csv, mode="r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        lote = []
-        for fila in reader:
+    lote = []
+
+    with open(ruta_csv, mode="r", encoding="utf-8", newline="") as archivo:
+        lector = csv.DictReader(archivo)
+
+        for fila in lector:
             lote.append(fila)
-            if len(lote) >= tamano_lote:
+
+            if len(lote) == tamano_lote:
                 yield lote
                 lote = []
+
+        # Entregar el último lote si tiene menos de 2000 filas
         if lote:
             yield lote
-
 
 # =============================================================================
 # FASE 2: TRANSFORM - REGLAS DE NEGOCIO Y LIMPIEZA LOTE A LOTE (CLÍNICA)
@@ -102,44 +90,54 @@ def transformar_lote(lote_raw):
     """
     lote_transformado = []
 
-    for reg in lote_raw:
-        # TODO: COMPLETAR LA LÓGICA DE TRANSFORMACIÓN POR EL ESTUDIANTE
+    for registro in lote_raw:
         try:
-            costo_str = reg.get("costo_consulta", "")
-            if not costo_str:
-                continue  # Descartar nulos
+            costo_texto = registro.get("costo_consulta", "").strip()
 
-            costo = float(costo_str)
+            # Regla 1: eliminar costos vacíos
+            if not costo_texto:
+                continue
+
+            costo = float(costo_texto)
+
+            # Regla 1: eliminar costos menores o iguales a cero
             if costo <= 0:
-                continue  # Descartar costos inválidos/negativos
+                continue
 
-            # Cálculos de clínica
-            comision = round(costo * 0.05, 2)
-            costo_neto = round(costo - comision, 2)
-            
-            estado = reg.get("estado_paciente", "Leve")
-            alerta_gravedad = (costo > 200.0) and (estado in ["Critico", "Grave"])
+            # Regla 2: comisión administrativa del seguro
+            comision_seguro = round(costo * 0.05, 2)
 
-            tupla_registro = (
-                reg["id_admision"],
-                reg["fecha_ingreso"],
-                reg["id_paciente"],
-                reg["cama_asignada"],
-                reg["diagnostico"],
+            # Regla 3: costo neto
+            costo_neto = round(costo - comision_seguro, 2)
+
+            estado = registro.get("estado_paciente", "").strip()
+
+            # Regla 4: alerta de gravedad
+            alerta_gravedad = (
+                costo > 200.00
+                and estado in ("Grave", "Critico")
+            )
+
+            fila_transformada = (
+                registro["id_admision"],
+                registro["fecha_ingreso"],
+                registro["id_paciente"],
+                registro["cama_asignada"],
+                registro["diagnostico"],
                 costo,
-                comision,
+                comision_seguro,
                 costo_neto,
                 alerta_gravedad,
                 estado
             )
-            lote_transformado.append(tupla_registro)
 
-        except (ValueError, TypeError):
-            # En caso de error en parseo de la fila, se omite el registro corrupto
+            lote_transformado.append(fila_transformada)
+
+        except (ValueError, TypeError, KeyError):
+            # Si la fila está dañada o le faltan columnas, se descarta
             continue
 
     return lote_transformado
-
 
 # =============================================================================
 # FASE 3: LOAD - CARGA EN LOTE (BATCH LOAD) EN BASE DE DATOS
@@ -148,103 +146,164 @@ def cargar_lote_sqlite(conn, lote_transformado):
     """
     Carga un lote de registros transformados en la base de datos SQLite.
     """
+    if not lote_transformado:
+        return
+
     sql = """
-    INSERT INTO admisiones_emergencia 
-    (id_admision, fecha_ingreso, id_paciente, cama_asignada, diagnostico, 
-     costo_consulta, comision_seguro, costo_neto, alerta_gravedad, estado_paciente)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        INSERT INTO admisiones_emergencia (
+            id_admision,
+            fecha_ingreso,
+            id_paciente,
+            cama_asignada,
+            diagnostico,
+            costo_consulta,
+            comision_seguro,
+            costo_neto,
+            alerta_gravedad,
+            estado_paciente
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
     """
+
     cursor = conn.cursor()
     cursor.executemany(sql, lote_transformado)
     conn.commit()
 
-
-def cargar_lote_postgres(conn, lote_transformado):
+def cargar_lote_mysql(conn, lote_transformado):
     """
     Carga un lote de registros transformados en PostgreSQL utilizando execute_values o executemany.
     """
     # TODO: SI USAN POSTGRESQL, IMPLEMENTAR AQUÍ CON PSYCOPG2
-    sql = """
-    INSERT INTO admisiones_emergencia 
-    (id_admision, fecha_ingreso, id_paciente, cama_asignada, diagnostico, 
-     costo_consulta, comision_seguro, costo_neto, alerta_gravedad, estado_paciente)
-    VALUES %s;
-    """
-    cursor = conn.cursor()
-    execute_values(cursor, sql, lote_transformado)
-    conn.commit()
+    if not lote_transformado:
+        return
 
+    sql = """
+        INSERT INTO admisiones_emergencia (
+            id_admision,
+            fecha_ingreso,
+            id_paciente,
+            cama_asignada,
+            diagnostico,
+            costo_consulta,
+            comision_seguro,
+            costo_neto,
+            alerta_gravedad,
+            estado_paciente
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+    """
+
+    cursor = conn.cursor()
+
+    try:
+        cursor.executemany(sql, lote_transformado)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
 
 # =============================================================================
 # EJECUCIÓN PRINCIPAL Y MONITOREO DE MEMORIA RAM
 # =============================================================================
 def ejecutar_pipeline():
     directorio_base = os.path.dirname(os.path.abspath(__file__))
-    ruta_csv = os.path.join(directorio_base, "logs_admisiones_masivas.csv")
-    ruta_db_sqlite = os.path.join(directorio_base, "taller_etl_resultado.db")
+
+    ruta_csv = os.path.join(
+        directorio_base,
+        "logs_admisiones_masivas.csv"
+    )
 
     print("=" * 70)
     print(" INICIANDO PIPELINE ETL CON GENERADORES - CLÍNICA SAN JOSÉ ")
     print("=" * 70)
 
-    # Medición de consumo de memoria RAM (tracemalloc)
+    # Verificar que el conector de MySQL esté instalado
+    if not MYSQL_DISPONIBLE:
+        raise RuntimeError(
+            "No está instalado mysql-connector-python. "
+            "Ejecuta: python3 -m pip install mysql-connector-python"
+        )
+
+    # Conexión con MySQL
+    conn = connector.connect(
+        host="localhost",
+        port=3306,
+        user="root",
+        password=getpass("Escribe tu contraseña de MySQL: "),
+        database="clinica_san_jose",
+        charset="utf8mb4"
+    )
+
+    print("-> Conexión con MySQL establecida correctamente.")
+
+    # Iniciar medición de RAM y tiempo
     tracemalloc.start()
     tiempo_inicio = time.time()
-
-    # Inicializar Base de Datos Destino (Ejemplo local en SQLite)
-    conn = sqlite3.connect(ruta_db_sqlite)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS admisiones_emergencia (
-            id_admision TEXT PRIMARY KEY,
-            fecha_ingreso TEXT,
-            id_paciente TEXT,
-            cama_asignada TEXT,
-            diagnostico TEXT,
-            costo_consulta REAL,
-            comision_seguro REAL,
-            costo_neto REAL,
-            alerta_gravedad INTEGER,
-            estado_paciente TEXT
-        );
-    """)
-    conn.commit()
 
     total_procesados = 0
     total_lotes = 0
 
-    print("-> Procesando archivo masivo en lotes (Streaming via yield)...")
+    print("-> Procesando archivo masivo en lotes usando yield...")
 
-    # Bucle del ETL: Iteramos directamente sobre el GENERADOR
-    for lote_raw in extractor_lotes_csv(ruta_csv, tamano_lote=5000):
-        total_lotes += 1
-        
-        # 1. Transformar lote
-        lote_listo = transformar_lote(lote_raw)
+    try:
+        # EXTRACT: obtener un lote de 2000 registros
+        for lote_raw in extractor_lotes_csv(
+            ruta_csv,
+            tamano_lote=2000
+        ):
+            total_lotes += 1
 
-        # 2. Cargar lote
-        cargar_lote_sqlite(conn, lote_listo)
+            # TRANSFORM: limpiar y calcular valores
+            lote_transformado = transformar_lote(lote_raw)
 
-        total_procesados += len(lote_listo)
+            # LOAD: insertar el lote en MySQL
+            cargar_lote_mysql(conn, lote_transformado)
 
-        # Reportar estado
-        peak_ram_mb = tracemalloc.get_traced_memory()[1] / (1024 * 1024)
-        print(f"   [Lote #{total_lotes:02d}] Cargadas {len(lote_listo):,} filas | Acumulado: {total_procesados:,} | RAM Pico: {peak_ram_mb:.2f} MB")
+            total_procesados += len(lote_transformado)
 
-    conn.close()
+            # Obtener memoria pico del proceso
+            memoria_actual, memoria_pico = (
+                tracemalloc.get_traced_memory()
+            )
+
+            memoria_pico_mb = memoria_pico / (1024 * 1024)
+
+            print(
+                f"Lote #{total_lotes}: "
+                f"{len(lote_transformado):,} filas cargadas | "
+                f"Total: {total_procesados:,} | "
+                f"RAM pico: {memoria_pico_mb:.2f} MB"
+            )
+
+    finally:
+        # Cerrar la conexión aunque ocurra un error
+        if conn.is_connected():
+            conn.close()
+            print("-> Conexión con MySQL cerrada.")
+
+    # Calcular resultados finales
     duracion = time.time() - tiempo_inicio
-    memoria_final_mb = tracemalloc.get_traced_memory()[1] / (1024 * 1024)
+
+    memoria_actual, memoria_pico = tracemalloc.get_traced_memory()
+    memoria_pico_mb = memoria_pico / (1024 * 1024)
+
     tracemalloc.stop()
 
-    print("\n-------------------------------------------------------------------")
-    print(" SUMMARY DE RENDIMIENTO DEL PIPELINE:")
-    print("-------------------------------------------------------------------")
-    print(f" - Filas totales cargadas con éxito: {total_procesados:,}")
-    print(f" - Lotes procesados:                 {total_lotes}")
-    print(f" - Tiempo de ejecución:              {duracion:.2f} segundos")
-    print(f" - Consumo máximo de RAM (Pico RAM): {memoria_final_mb:.2f} MB")
-    print("===================================================================")
-    print(" [ÉXITO] El consumo de RAM se mantuvo CONSTANTE gracias al uso de yield.")
+    print("\n" + "=" * 70)
+    print(" RESUMEN DEL PIPELINE ETL")
+    print("=" * 70)
+    print(f"Filas cargadas:    {total_procesados:,}")
+    print(f"Lotes procesados:  {total_lotes}")
+    print(f"Tiempo:            {duracion:.2f} segundos")
+    print(f"RAM pico:          {memoria_pico_mb:.2f} MB")
+
+    if memoria_pico_mb <= 20:
+        print("[ÉXITO] El pipeline respetó el límite de 20 MB.")
+    else:
+        print("[ADVERTENCIA] El pipeline superó el límite de 20 MB.")
+
 
 if __name__ == "__main__":
     ejecutar_pipeline()
